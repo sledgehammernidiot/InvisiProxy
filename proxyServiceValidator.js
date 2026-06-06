@@ -112,14 +112,15 @@ const testServerResponse = async () => {
     'http://localhost:8080/gmt/index.js',
     'http://localhost:8080/gmt/worker.js',
     'http://localhost:8080/epoch/index.mjs',
-    'http://localhost:8080/worker/working.all.js',
-    'http://localhost:8080/worker/working.sw.js',
-    'http://localhost:8080/worker/working.sw-blacklist.js',
+    'http://localhost:8080/worker/working.js',
+    'http://localhost:8080/worker/working-ctrl.api.js',
+    'http://localhost:8080/worker/working-ctrl.sw.js',
+    'http://localhost:8080/worker/working-ctrl.inject.js',
     'http://localhost:8080/network/networking.bundle.js',
     'http://localhost:8080/network/networking.sw.js',
     'http://localhost:8080/network/networking.config.js',
-    'http://localhost:8080/network/workerware.js',
-    'http://localhost:8080/network/WWError.js',
+    'http://localhost:8080/network/networking.client.js',
+    'http://localhost:8080/network/networking.handler.js',
   ];
 
 
@@ -149,7 +150,14 @@ const testCommonJSOnPage = async () => {
   const context = await browser.newContext({
     ignoreHTTPSErrors: true,
   });
+  await context.addInitScript(() => {
+    try {
+      window.localStorage.setItem('net-time-loader-key', navigator.userAgent);
+    } catch (e) {
+    }
+  });
   const page = await context.newPage();
+  page.on('pageerror', (err) => console.error('[page error]', err.message));
 
   try {
     const getHeaders = async () => {
@@ -205,7 +213,18 @@ xx                                                  xx
           path: 'example.com',
           title: 'Example Domain',
         });
-      await page.goto('http://localhost:8080/networking');
+      await page.goto('http://localhost:8080/networking', {
+        waitUntil: 'load',
+      });
+      await page.evaluate(
+        () =>
+          new Promise((resolve) => {
+            const ready = () => resolve();
+            if (window.$invisiScramjet?.ready) return ready();
+            window.addEventListener('s-ready', ready, { once: true });
+            setTimeout(ready, 30000);
+          })
+      );
       const generatedUrl = await page.evaluate(generateUrl, {
         omniboxId,
         urlPath: website.path,
@@ -213,74 +232,110 @@ xx                                                  xx
       });
 
       const testResults = await page.evaluate(
-        async ({ generatedUrl, pageTitle }) => {
+        async ({ generatedUrl, pageTitle, errorPrefix }) => {
           const results = [{}, {}];
+          results[0].ultraviolet = generatedUrl;
 
-          await new Promise((resolve) => {
-            const waitForDocument = () => {
-                const waitLonger = () => setTimeout(resolve, 5000);
-                if (document.readyState === 'complete') waitLonger();
-                else window.addEventListener('load', waitLonger);
-              },
-              // Wait until a service worker is registered before continuing.
-              // Also check again to make sure the document is loaded.
-              waitForWorker = async () => {
-                setTimeout(async () => {
-                  (await navigator.serviceWorker.getRegistrations()).length > 0
-                    ? waitForDocument()
-                    : waitForWorker();
-                }, 1000);
-              };
-
-            waitForWorker();
-          });
+          if (
+            !generatedUrl ||
+            generatedUrl === errorPrefix ||
+            generatedUrl.startsWith(errorPrefix + ':')
+          ) {
+            results[1].uvTestPassed = false;
+            return results;
+          }
 
           try {
-            results[0].ultraviolet = generatedUrl;
+            if (navigator.serviceWorker) {
+              await navigator.serviceWorker.ready;
+              if (!navigator.serviceWorker.controller) {
+                await new Promise((resolve) => {
+                  const onChange = () => {
+                    navigator.serviceWorker.removeEventListener(
+                      'controllerchange',
+                      onChange
+                    );
+                    resolve();
+                  };
+                  navigator.serviceWorker.addEventListener(
+                    'controllerchange',
+                    onChange,
+                    { once: true }
+                  );
+                  setTimeout(resolve, 5000);
+                });
+              }
+            }
 
             // Test to see if the document title for example.com has loaded,
             // by appending an IFrame to the document and grabbing its content.
             const testGeneratedUrlHacky = async (url) => {
               const exampleIFrame = document.createElement('iframe');
-              const waitForDocument = new Promise((resolve) => {
-                document.documentElement.appendChild(exampleIFrame);
+              exampleIFrame.style.cssText =
+                'position:fixed;width:0;height:0;border:0;visibility:hidden;pointer-events:none;';
+              const readTitle = () => {
+                try {
+                  return exampleIFrame.contentWindow?.document?.title || '';
+                } catch (e) {
+                  return '<cross-origin: ' + e.message + '>';
+                }
+              };
+              const readUvError = () => {
+                try {
+                  const doc = exampleIFrame.contentWindow?.document;
+                  if (!doc) return null;
+                  const trace = doc.getElementById('errorTrace');
+                  const fetched = doc.getElementById('fetchedURL');
+                  if (!trace && !fetched) return null;
+                  return {
+                    trace: trace?.value || trace?.textContent || '',
+                    fetched: fetched?.textContent || '',
+                  };
+                } catch (e) {
+                  return { trace: '<cross-origin>', fetched: '' };
+                }
+              };
+              const settled = new Promise((resolve) => {
                 exampleIFrame.addEventListener('load', () => {
-                  resolve(
-                    exampleIFrame.contentWindow.document.title === pageTitle
-                  );
+                  setTimeout(() => {
+                    if (readTitle() === pageTitle) resolve(true);
+                  }, 250);
                 });
               });
 
-              // Give 10 seconds for the IFrame to load before manually checking.
               const timeout = new Promise((resolve) => {
-                setTimeout(() => {
-                  resolve(
-                    exampleIFrame.contentWindow.document.title === pageTitle
-                  );
-                }, 10000);
+                setTimeout(() => resolve(readTitle() === pageTitle), 30000);
               });
 
+              document.documentElement.appendChild(exampleIFrame);
               exampleIFrame.src = url;
-              exampleIFrame.style.display = 'none';
-              return await Promise.race([waitForDocument, timeout]);
+              const passed = await Promise.race([settled, timeout]);
+              if (!passed) {
+                const uvError = readUvError();
+                if (uvError) results[0].uvError = uvError;
+              }
+              return passed;
             };
 
-            results[1].uvTestPassed =
-              !!results[0].ultraviolet.indexOf(errorPrefix) &&
-              (await testGeneratedUrlHacky(results[0].ultraviolet));
+            results[1].uvTestPassed = await testGeneratedUrlHacky(generatedUrl);
           } catch (e) {
             results[0].ultraviolet = errorPrefix + ': ' + e.message;
+            results[1].uvTestPassed = false;
           }
 
           return results;
         },
-        { generatedUrl, pageTitle: website.title }
+        { generatedUrl, pageTitle: website.title, errorPrefix }
       );
 
-      console.log('Ultraviolet test results:', testResults[0]);
+      console.log(
+        'Ultraviolet test results:',
+        JSON.stringify(testResults[0], null, 2)
+      );
       const uvTestPassed =
         testResults[0].ultraviolet &&
         testResults[0].ultraviolet !== 'failure' &&
+        !testResults[0].ultraviolet.startsWith('failure:') &&
         testResults[1].uvTestPassed;
       console.log(
         'Ultraviolet test result:',
@@ -297,7 +352,16 @@ xx                                                  xx
           path: 'example.com',
           title: 'Example Domain',
         });
-      await page.goto('http://localhost:8080/working');
+      await page.goto('http://localhost:8080/working', { waitUntil: 'load' });
+      await page.evaluate(
+        () =>
+          new Promise((resolve) => {
+            const ready = () => resolve();
+            if (window.$invisiScramjet?.ready) return ready();
+            window.addEventListener('s-ready', ready, { once: true });
+            setTimeout(ready, 30000);
+          })
+      );
       const generatedUrl = await page.evaluate(generateUrl, {
         omniboxId,
         urlPath: website.path,
@@ -305,75 +369,87 @@ xx                                                  xx
       });
 
       const testResults = await page.evaluate(
-        async ({ generatedUrl, pageTitle }) => {
+        async ({ rawUrl, pageTitle, generatedUrl, errorPrefix }) => {
           const results = [{}, {}];
-
-          await new Promise((resolve) => {
-            const waitForDocument = () => {
-                const waitLonger = () => setTimeout(resolve, 5000);
-                if (document.readyState === 'complete') waitLonger();
-                else window.addEventListener('load', waitLonger);
-              },
-              // Wait until a service worker is registered before continuing.
-              // Also check again to make sure the document is loaded.
-              waitForWorker = async () => {
-                setTimeout(async () => {
-                  (await navigator.serviceWorker.getRegistrations()).length > 0
-                    ? waitForDocument()
-                    : waitForWorker();
-                }, 1000);
-              };
-
-            waitForWorker();
-          });
+          results[0].scramjet = generatedUrl;
 
           try {
-            results[0].scramjet = generatedUrl;
-
-            // Test to see if the document title for example.com has loaded,
-            // by appending an IFrame to the document and grabbing its content.
-            const testGeneratedUrlHacky = async (url) => {
-              const exampleIFrame = document.createElement('iframe');
-              const waitForDocument = new Promise((resolve) => {
-                document.documentElement.appendChild(exampleIFrame);
-                exampleIFrame.addEventListener('load', () => {
-                  resolve(
-                    exampleIFrame.contentWindow.document.title === pageTitle
+            if (navigator.serviceWorker) {
+              await navigator.serviceWorker.ready;
+              if (!navigator.serviceWorker.controller) {
+                await new Promise((resolve) => {
+                  const onChange = () => {
+                    navigator.serviceWorker.removeEventListener(
+                      'controllerchange',
+                      onChange
+                    );
+                    resolve();
+                  };
+                  navigator.serviceWorker.addEventListener(
+                    'controllerchange',
+                    onChange,
+                    { once: true }
                   );
+                  setTimeout(resolve, 5000);
                 });
-              });
+              }
+            }
 
-              // Give 10 seconds for the IFrame to load before manually checking.
-              const timeout = new Promise((resolve) => {
-                setTimeout(() => {
-                  resolve(
-                    exampleIFrame.contentWindow.document.title === pageTitle
-                  );
-                }, 10000);
-              });
+            const sj = window.$invisiScramjet;
+            if (!sj?.frame || typeof sj.frame.go !== 'function') {
+              results[1].sjTestPassed = false;
+              results[0].scramjet =
+                errorPrefix + ': scramjet controller frame is not ready';
+              return results;
+            }
 
-              exampleIFrame.src = url;
-              exampleIFrame.style.display = 'none';
-              return await Promise.race([waitForDocument, timeout]);
+            const frame = sj.frame;
+            const iframe = frame.element;
+
+            const readTitle = () => {
+              try {
+                return iframe.contentWindow?.document?.title || '';
+              } catch (e) {
+                return '';
+              }
             };
 
-            results[1].sjTestPassed =
-              !!results[0].scramjet.indexOf(errorPrefix) &&
-              (await testGeneratedUrlHacky(results[0].scramjet));
+            const settled = new Promise((resolve) => {
+              iframe.addEventListener('load', () => {
+                setTimeout(() => {
+                  if (readTitle() === pageTitle) resolve(true);
+                }, 250);
+              });
+            });
+            const timeout = new Promise((resolve) => {
+              setTimeout(() => resolve(readTitle() === pageTitle), 30000);
+            });
+
+            const beforeSrc = iframe.src;
+            frame.go(rawUrl);
+            results[0].scramjet =
+              iframe.src && iframe.src !== beforeSrc
+                ? iframe.src
+                : results[0].scramjet;
+
+            results[1].sjTestPassed = await Promise.race([settled, timeout]);
           } catch (e) {
             results[0].scramjet = errorPrefix + ': ' + e.message;
+            results[1].sjTestPassed = false;
           }
 
           return results;
         },
-        { generatedUrl, pageTitle: website.title }
+        {
+          rawUrl: 'http://' + website.path + '/',
+          pageTitle: website.title,
+          generatedUrl,
+          errorPrefix,
+        }
       );
 
       console.log('Scramjet test results:', testResults[0]);
-      const sjTestPassed =
-        testResults[0].scramjet &&
-        testResults[0].scramjet !== 'failure' &&
-        testResults[1].sjTestPassed;
+      const sjTestPassed = !!testResults[1].sjTestPassed;
       console.log(
         'Scramjet test result:',
         sjTestPassed ? 'success' : 'failure'

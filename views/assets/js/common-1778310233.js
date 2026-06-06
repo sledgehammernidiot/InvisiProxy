@@ -498,7 +498,12 @@ const preparePage = async () => {
         if (e.code === 'Enter') goProxMethod(searchMode)();
         // This is exclusively used for the validator script.
         else if (e.code === 'Validator Test') {
-          e.target.value = await goProx[type](e.target.value);
+          const rawValue = e.target.value;
+          let resolved;
+          if (type === 'ultraviolet') resolved = uvUrl(rawValue);
+          else if (type === 'scramjet') resolved = sjUrl(rawValue);
+          else resolved = search(rawValue);
+          e.target.value = resolved == null ? '' : resolved;
           e.target.dispatchEvent(new Event('change'));
         }
       });
